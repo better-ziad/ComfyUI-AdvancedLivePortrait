@@ -641,6 +641,52 @@ class PrintExpData:
         print(f"sorted_list: {[[item[2], round(float(item[1]),1)] for item in sorted_list]}")
         return (exp,)
 
+class HeadSizeControl:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {"required": {
+            "head_size": ("FLOAT", {"default": 0, "min": -1.0, "max": 1.0, "step": 0.01}),
+            "neck_scale": ("FLOAT", {"default": 1.0, "min": 0.3, "max": 1.5, "step": 0.01}),
+        },
+            "optional": {"add_exp": ("EXP_DATA",), }
+        }
+
+    RETURN_TYPES = ("EXP_DATA",)
+    RETURN_NAMES = ("exp",)
+    FUNCTION = "run"
+    CATEGORY = "AdvancedLivePortrait"
+
+    def run(self, head_size, neck_scale, add_exp=None):
+        if add_exp == None:
+            es = ExpressionSet()
+        else:
+            es = ExpressionSet(es=add_exp)
+
+        es.s = head_size
+        
+        # Apply neck scaling if different from 1.0  
+        if neck_scale != 1.0:
+            # Use similar magnitude to facial expressions (0.001 to 0.01 range)
+            neck_adjustment = (neck_scale - 1.0) * 0.02
+            
+            # Target unused keypoints that might control jaw/neck area
+            # Avoid: 1,2(eyebrows), 3,7(cheeks), 11,13,15,16(eyes), 14,17,19,20(mouth)
+            # Try: 0, 4, 5, 6, 8, 9, 10, 12, 18 (potential jaw/neck keypoints)
+            
+            # Primary neck width control - X axis adjustments
+            jaw_keypoints = [4, 5, 6, 8, 9, 10, 12, 18]
+            
+            for idx in jaw_keypoints:
+                # Adjust width (X coordinate) 
+                es.e[0, idx, 0] += neck_adjustment
+                
+            # If available, try keypoint 0 for central control
+            if neck_adjustment != 0:
+                es.e[0, 0, 0] += neck_adjustment * 0.5
+                es.e[0, 0, 1] += neck_adjustment * 0.3
+
+        return (es,)
+
 class Command:
     def __init__(self, es, change, keep):
         self.es:ExpressionSet = es
@@ -963,6 +1009,492 @@ class ExpressionEditor:
 
         return {"ui": {"images": results}, "result": (out_img, new_editor_link, es)}
 
+class NeckSlimming:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "face_image": ("IMAGE",),
+                "face_mask": ("IMAGE",),
+                "neck_mask": ("IMAGE",),
+                "thin_factor": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 2.5, "step": 0.1}),
+                "feather_px": ("FLOAT", {"default": 20.0, "min": 1.0, "max": 50.0, "step": 1.0}),
+                "dilate_px": ("INT", {"default": 6, "min": 0, "max": 20, "step": 1}),
+            }
+        }
+
+    RETURN_TYPES = ("IMAGE",)
+    RETURN_NAMES = ("slimmed_image",)
+    FUNCTION = "slim_neck"
+    CATEGORY = "AdvancedLivePortrait"
+
+    def slim_neck(self, face_image, face_mask, neck_mask, thin_factor, feather_px, dilate_px):
+        # Convert from ComfyUI tensors to numpy arrays
+        img_np = (face_image.squeeze(0).cpu().numpy() * 255).astype(np.uint8)
+        face_mask_np = (face_mask.squeeze(0).cpu().numpy() * 255).astype(np.uint8)
+        neck_mask_np = (neck_mask.squeeze(0).cpu().numpy() * 255).astype(np.uint8)
+        
+        # Convert RGB to BGR for OpenCV
+        img_bgr = cv2.cvtColor(img_np, cv2.COLOR_RGB2BGR)
+        
+        # Handle mask dimensions - take the first channel if RGB
+        if len(face_mask_np.shape) == 3:
+            face_mask_gray = face_mask_np[:, :, 0]
+        else:
+            face_mask_gray = face_mask_np
+            
+        if len(neck_mask_np.shape) == 3:
+            neck_mask_gray = neck_mask_np[:, :, 0]
+        else:
+            neck_mask_gray = neck_mask_np
+
+        h, w = neck_mask_gray.shape[:2]
+        M = (neck_mask_gray > 127).astype(np.uint8)
+        F = (face_mask_gray > 127).astype(np.uint8)
+
+        # Dilate face mask to ensure no warping near jawline
+        if dilate_px > 0:
+            kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2*dilate_px+1, 2*dilate_px+1))
+            F_dil = cv2.dilate(F, kernel)
+        else:
+            F_dil = F
+
+        # Distance transforms
+        inside_dt = cv2.distanceTransform(M, cv2.DIST_L2, 3)
+        outside_dt = cv2.distanceTransform(1 - M, cv2.DIST_L2, 3)
+
+        inside_power = 1.0
+        outside_scale = 0.25
+
+        inside_w = (inside_dt / (inside_dt.max() + 1e-6)) ** inside_power if inside_dt.max() > 0 else inside_dt
+        outside_w = np.exp(-outside_dt / max(feather_px, 1e-6))
+
+        # Zero out weights in/near the face region to prevent any influence there
+        inside_w[F_dil == 1] = 0.0
+        outside_w[F_dil == 1] = 0.0
+
+        # Build row-wise centerline over the neck (and extend to all rows)
+        centers = np.full(h, np.nan, dtype=np.float32)
+        ys = np.where(M.any(axis=1))[0]
+        if ys.size > 0:
+            for y in ys:
+                xs = np.where(M[y] > 0)[0]
+                if xs.size > 0:
+                    centers[y] = (xs.min() + xs.max()) / 2.0
+            first, last = ys.min(), ys.max()
+            for y in range(first + 1, last + 1):
+                if np.isnan(centers[y]): 
+                    centers[y] = centers[y - 1]
+            for y in range(last - 1, first - 1, -1):
+                if np.isnan(centers[y]): 
+                    centers[y] = centers[y + 1]
+            centers[:first] = centers[first]
+            centers[last+1:] = centers[last]
+        else:
+            centers[:] = w / 2.0
+
+        X, Y = np.meshgrid(np.arange(w, dtype=np.float32), np.arange(h, dtype=np.float32))
+        C = centers[:, None].astype(np.float32)
+
+        dx_in = -thin_factor * (X - C) * inside_w
+        dx_out = outside_scale * thin_factor * (X - C) * outside_w
+        dx = dx_in + dx_out
+
+        # Explicitly zero displacement in the (dilated) face area for extra safety
+        dx[F_dil == 1] = 0.0
+
+        map_x = np.clip(X + dx, 0, w - 1).astype(np.float32)
+        map_y = Y.astype(np.float32)
+
+        warped = cv2.remap(img_bgr, map_x, map_y, interpolation=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REFLECT)
+
+        # Paste back original face pixels (non-interpolated) for exact preservation
+        face_region = (F_dil == 1)
+        warped[face_region] = img_bgr[face_region]
+
+        # Convert back to RGB and ComfyUI tensor format
+        result_rgb = cv2.cvtColor(warped, cv2.COLOR_BGR2RGB)
+        result_tensor = torch.from_numpy(result_rgb.astype(np.float32) / 255.0).unsqueeze(0)
+        
+        return (result_tensor,)
+
+class HeadNeckResize:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "face_image": ("IMAGE",),
+                "head_mask": ("IMAGE",),
+                "neck_mask": ("IMAGE",),
+                "neck_scale_horizontal": ("FLOAT", {"default": 0.8, "min": 0.5, "max": 1.2, "step": 0.01}),
+                "neck_scale_vertical": ("FLOAT", {"default": 0.8, "min": 0.5, "max": 1.2, "step": 0.01}),
+                "blur_radius": ("INT", {"default": 15, "min": 5, "max": 50, "step": 1}),
+                "feather_edge": ("INT", {"default": 10, "min": 2, "max": 30, "step": 1}),
+            }
+        }
+
+    RETURN_TYPES = ("IMAGE",)
+    RETURN_NAMES = ("resized_image",)
+    FUNCTION = "resize_head_neck"
+    CATEGORY = "AdvancedLivePortrait"
+
+    def resize_head_neck(self, face_image, head_mask, neck_mask, neck_scale_horizontal, neck_scale_vertical, blur_radius, feather_edge):
+        # Convert from ComfyUI tensors to numpy arrays
+        img_np = (face_image.squeeze(0).cpu().numpy() * 255).astype(np.uint8)
+        head_mask_np = (head_mask.squeeze(0).cpu().numpy() * 255).astype(np.uint8)
+        neck_mask_np = (neck_mask.squeeze(0).cpu().numpy() * 255).astype(np.uint8)
+        
+        # Handle mask dimensions - take the first channel if RGB
+        if len(head_mask_np.shape) == 3:
+            head_mask_gray = head_mask_np[:, :, 0]
+        else:
+            head_mask_gray = head_mask_np
+            
+        if len(neck_mask_np.shape) == 3:
+            neck_mask_gray = neck_mask_np[:, :, 0]
+        else:
+            neck_mask_gray = neck_mask_np
+
+        h, w, c = img_np.shape
+        H = (head_mask_gray > 127).astype(np.uint8)
+        N = (neck_mask_gray > 127).astype(np.uint8)
+        
+        # Start with original image
+        result = img_np.copy()
+        
+        # Step 1: Process neck resize if needed
+        neck_position_changed = False
+        original_neck_top = None
+        new_neck_top = None
+        
+        if np.any(N > 0):
+            neck_coords = np.where(N > 0)
+            original_neck_top = neck_coords[0].min()
+            original_neck_bottom = neck_coords[0].max()
+            print(f"Original neck: top={original_neck_top}, bottom={original_neck_bottom}")
+            
+            # Only resize neck if scaling is different from 1.0
+            if neck_scale_horizontal != 1.0 or neck_scale_vertical != 1.0:
+                print(f"Resizing neck: h_scale={neck_scale_horizontal}, v_scale={neck_scale_vertical}")
+                
+                # Get neck bounding box
+                y_min, y_max = original_neck_top, original_neck_bottom
+                x_min, x_max = neck_coords[1].min(), neck_coords[1].max()
+                
+                # Calculate new neck dimensions
+                original_neck_height = y_max - y_min + 1
+                original_neck_width = x_max - x_min + 1
+                new_neck_height = max(1, int(original_neck_height * neck_scale_vertical))
+                new_neck_width = max(1, int(original_neck_width * neck_scale_horizontal))
+                
+                # New neck position (keep bottom, adjust top)
+                new_neck_top = y_max - new_neck_height + 1
+                neck_position_changed = True
+                
+                print(f"Neck resize: {original_neck_width}x{original_neck_height} -> {new_neck_width}x{new_neck_height}")
+                print(f"Neck position: top {original_neck_top} -> {new_neck_top}")
+                
+                # Apply neck resize
+                result = self._resize_region_simple(result, N, neck_scale_horizontal, neck_scale_vertical, blur_radius, feather_edge, anchor_bottom=True)
+            else:
+                new_neck_top = original_neck_top
+        
+        # # Step 2: Move head if neck position changed
+        # if np.any(H > 0) and neck_position_changed and new_neck_top is not None:
+        #     head_coords = np.where(H > 0)
+        #     original_head_bottom = head_coords[0].max()
+        #     head_height = original_head_bottom - head_coords[0].min() + 1
+            
+        #     # Calculate how much to move head down
+        #     head_move_distance = new_neck_top - original_head_bottom
+        #     print(f"Moving head down by {head_move_distance} pixels to connect with neck")
+            
+        #     if head_move_distance != 0:
+        #         result = self._move_region(result, H, 0, head_move_distance, blur_radius, feather_edge)
+        
+        # Convert back to ComfyUI tensor format
+        result_tensor = torch.from_numpy(result.astype(np.float32) / 255.0).unsqueeze(0)
+        
+        return (result_tensor,)
+
+    def _process_region(self, img, mask, scale, blur_radius, feather_edge, anchor_bottom=False, return_position=False, target_bottom_y=None):
+        """
+        Process a region (head or neck) with scaling and blending
+        
+        Args:
+            img: Input image (H, W, C)
+            mask: Binary mask for the region
+            scale: Scaling factor (can be tuple for (horizontal, vertical) or single value)
+            blur_radius: Blur radius for seamless blending
+            feather_edge: Edge feathering for smooth transition
+            anchor_bottom: If True, anchor the bottom of the region (for neck)
+            return_position: If True, return the new top position
+            target_bottom_y: If provided, position the region so its bottom aligns with this Y coordinate
+        """
+        h, w = mask.shape
+        
+        # Find bounding box of the region
+        coords = np.where(mask > 0)
+        if len(coords[0]) == 0:
+            if return_position:
+                return img, None
+            return img
+            
+        y_min, y_max = coords[0].min(), coords[0].max()
+        x_min, x_max = coords[1].min(), coords[1].max()
+        
+        # Extract the region
+        region_h = y_max - y_min + 1
+        region_w = x_max - x_min + 1
+        
+        # Validate region dimensions
+        if region_h <= 0 or region_w <= 0:
+            print(f"Warning: Invalid region dimensions: {region_w}x{region_h}")
+            if return_position:
+                return img, None
+            return img
+        
+        # Handle scaling (can be tuple or single value)
+        if isinstance(scale, tuple):
+            scale_w, scale_h = scale
+        else:
+            scale_w = scale_h = scale
+        
+        # Calculate new dimensions
+        new_h = max(1, int(region_h * scale_h))  # Ensure minimum size of 1
+        new_w = max(1, int(region_w * scale_w))  # Ensure minimum size of 1
+        
+        # Extract and resize the image region
+        img_region = img[y_min:y_max+1, x_min:x_max+1]
+        mask_region = mask[y_min:y_max+1, x_min:x_max+1]
+        
+        # Validate extracted regions
+        if img_region.size == 0 or mask_region.size == 0:
+            print(f"Warning: Empty region extracted: img_region.shape={img_region.shape}, mask_region.shape={mask_region.shape}")
+            if return_position:
+                return img, None
+            return img
+        
+        # Resize both image and mask
+        resized_img = cv2.resize(img_region, (new_w, new_h), interpolation=cv2.INTER_LANCZOS4)
+        resized_mask = cv2.resize(mask_region.astype(np.float32), (new_w, new_h), interpolation=cv2.INTER_LINEAR)
+        resized_mask = (resized_mask > 0.5).astype(np.uint8)
+        
+        # Calculate placement position
+        if target_bottom_y is not None:
+            # Position head so its bottom edge aligns with target_bottom_y (top of neck)
+            new_y = target_bottom_y - new_h
+            new_x = x_min + (region_w - new_w) // 2
+            print(f"Positioning head: target_bottom_y={target_bottom_y}, new_h={new_h}, new_y={new_y}")
+        elif anchor_bottom:
+            # For neck: keep bottom edge at same position, but update top
+            new_y = y_max - new_h + 1
+            new_x = x_min + (region_w - new_w) // 2
+            print(f"Positioning neck: y_max={y_max}, new_h={new_h}, new_y={new_y}")
+        else:
+            # For head: center the region (fallback)
+            new_y = y_min + (region_h - new_h) // 2
+            new_x = x_min + (region_w - new_w) // 2
+        
+        # Ensure bounds
+        new_y = max(0, min(h - new_h, new_y))
+        new_x = max(0, min(w - new_w, new_x))
+        
+        # Create result image
+        result = img.copy()
+        
+        # First, fill the original area with background estimation
+        original_mask_3d = np.stack([mask] * 3, axis=-1)
+        result = self._fill_background(result, original_mask_3d, blur_radius)
+        
+        # Create feathered mask for smooth blending
+        feathered_mask = self._create_feathered_mask(resized_mask, feather_edge)
+        feathered_mask_3d = np.stack([feathered_mask] * 3, axis=-1)
+        
+        # Place the resized region
+        y_end = min(h, new_y + new_h)
+        x_end = min(w, new_x + new_w)
+        
+        # Handle cropping if the resized region exceeds image bounds
+        crop_h = y_end - new_y
+        crop_w = x_end - new_x
+        
+        if crop_h > 0 and crop_w > 0:
+            resized_img_crop = resized_img[:crop_h, :crop_w]
+            feathered_mask_crop = feathered_mask_3d[:crop_h, :crop_w]
+            
+            # Blend the resized region
+            result[new_y:y_end, new_x:x_end] = (
+                resized_img_crop * feathered_mask_crop + 
+                result[new_y:y_end, new_x:x_end] * (1 - feathered_mask_crop)
+            ).astype(np.uint8)
+        
+        if return_position:
+            # For neck, return the top Y position of the resized region
+            return result, new_y
+        return result
+
+    def _fill_background(self, img, mask_3d, blur_radius):
+        """Fill masked areas with blurred surrounding content"""
+        result = img.copy()
+        
+        # Create a version with the masked area filled by inpainting
+        mask_single = mask_3d[:, :, 0]
+        
+        if np.any(mask_single > 0):
+            # Use OpenCV inpainting to fill the hole
+            inpainted = cv2.inpaint(img, mask_single, blur_radius, cv2.INPAINT_TELEA)
+            
+            # Blend with blurred version for smoother result
+            blurred = cv2.GaussianBlur(img, (blur_radius*2+1, blur_radius*2+1), blur_radius/3)
+            
+            # Use inpainted result where mask is, original where not
+            result = np.where(mask_3d > 0, inpainted, img)
+            
+        return result
+
+    def _create_feathered_mask(self, mask, feather_edge):
+        """Create a feathered mask for smooth blending"""
+        if feather_edge <= 0:
+            return mask.astype(np.float32)
+        
+        # Distance transform for smooth falloff
+        mask_float = mask.astype(np.float32)
+        
+        # Erode mask to create inner area
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (feather_edge*2+1, feather_edge*2+1))
+        inner_mask = cv2.erode(mask, kernel)
+        
+        # Distance transform from edge
+        edge_mask = mask - inner_mask
+        if np.any(edge_mask > 0):
+            # Create smooth gradient
+            dist_transform = cv2.distanceTransform(mask, cv2.DIST_L2, 3)
+            edge_dist = cv2.distanceTransform(1 - edge_mask, cv2.DIST_L2, 3)
+            
+            # Normalize and create smooth falloff
+            edge_dist = np.minimum(edge_dist, feather_edge)
+            smooth_mask = edge_dist / feather_edge
+            
+            # Combine inner (full) and edge (gradient) areas
+            result = np.where(inner_mask > 0, 1.0, smooth_mask)
+            result = np.where(mask == 0, 0.0, result)
+        else:
+            result = mask_float
+        
+        return np.clip(result, 0.0, 1.0)
+
+    def _resize_region_simple(self, img, mask, scale_x, scale_y, blur_radius, feather_edge, anchor_bottom=False):
+        """Simple region resize with clear logic"""
+        h, w = mask.shape
+        coords = np.where(mask > 0)
+        if len(coords[0]) == 0:
+            return img
+            
+        y_min, y_max = coords[0].min(), coords[0].max()
+        x_min, x_max = coords[1].min(), coords[1].max()
+        
+        # Extract region
+        region_h = y_max - y_min + 1
+        region_w = x_max - x_min + 1
+        new_h = max(1, int(region_h * scale_y))
+        new_w = max(1, int(region_w * scale_x))
+        
+        img_region = img[y_min:y_max+1, x_min:x_max+1]
+        mask_region = mask[y_min:y_max+1, x_min:x_max+1]
+        
+        # Resize
+        resized_img = cv2.resize(img_region, (new_w, new_h), interpolation=cv2.INTER_LANCZOS4)
+        resized_mask = cv2.resize(mask_region.astype(np.float32), (new_w, new_h), interpolation=cv2.INTER_LINEAR)
+        resized_mask = (resized_mask > 0.5).astype(np.uint8)
+        
+        # Position
+        if anchor_bottom:
+            new_y = y_max - new_h + 1
+        else:
+            new_y = y_min + (region_h - new_h) // 2
+        new_x = x_min + (region_w - new_w) // 2
+        
+        # Bounds check
+        new_y = max(0, min(h - new_h, new_y))
+        new_x = max(0, min(w - new_w, new_x))
+        
+        # Apply to image
+        result = img.copy()
+        
+        # Fill original area
+        original_mask_3d = np.stack([mask] * 3, axis=-1)
+        result = self._fill_background(result, original_mask_3d, blur_radius)
+        
+        # Place resized region
+        feathered_mask = self._create_feathered_mask(resized_mask, feather_edge)
+        feathered_mask_3d = np.stack([feathered_mask] * 3, axis=-1)
+        
+        y_end = min(h, new_y + new_h)
+        x_end = min(w, new_x + new_w)
+        crop_h = y_end - new_y
+        crop_w = x_end - new_x
+        
+        if crop_h > 0 and crop_w > 0:
+            resized_img_crop = resized_img[:crop_h, :crop_w]
+            feathered_mask_crop = feathered_mask_3d[:crop_h, :crop_w]
+            result[new_y:y_end, new_x:x_end] = (
+                resized_img_crop * feathered_mask_crop + 
+                result[new_y:y_end, new_x:x_end] * (1 - feathered_mask_crop)
+            ).astype(np.uint8)
+        
+        return result
+
+    def _move_region(self, img, mask, move_x, move_y, blur_radius, feather_edge):
+        """Move a region without resizing"""
+        h, w = mask.shape
+        coords = np.where(mask > 0)
+        if len(coords[0]) == 0:
+            return img
+            
+        y_min, y_max = coords[0].min(), coords[0].max()
+        x_min, x_max = coords[1].min(), coords[1].max()
+        
+        # Extract region
+        img_region = img[y_min:y_max+1, x_min:x_max+1]
+        mask_region = mask[y_min:y_max+1, x_min:x_max+1]
+        
+        # New position
+        new_y = y_min + move_y
+        new_x = x_min + move_x
+        region_h = y_max - y_min + 1
+        region_w = x_max - x_min + 1
+        
+        # Bounds check
+        new_y = max(0, min(h - region_h, new_y))
+        new_x = max(0, min(w - region_w, new_x))
+        
+        # Apply to image
+        result = img.copy()
+        
+        # Fill original area
+        original_mask_3d = np.stack([mask] * 3, axis=-1)
+        result = self._fill_background(result, original_mask_3d, blur_radius)
+        
+        # Place moved region
+        feathered_mask = self._create_feathered_mask(mask_region, feather_edge)
+        feathered_mask_3d = np.stack([feathered_mask] * 3, axis=-1)
+        
+        y_end = min(h, new_y + region_h)
+        x_end = min(w, new_x + region_w)
+        crop_h = y_end - new_y
+        crop_w = x_end - new_x
+        
+        if crop_h > 0 and crop_w > 0:
+            img_crop = img_region[:crop_h, :crop_w]
+            mask_crop = feathered_mask_3d[:crop_h, :crop_w]
+            result[new_y:y_end, new_x:x_end] = (
+                img_crop * mask_crop + 
+                result[new_y:y_end, new_x:x_end] * (1 - mask_crop)
+            ).astype(np.uint8)
+        
+        return result
+
 NODE_CLASS_MAPPINGS = {
     "AdvancedLivePortrait": AdvancedLivePortrait,
     "ExpressionEditor": ExpressionEditor,
@@ -970,11 +1502,17 @@ NODE_CLASS_MAPPINGS = {
     "SaveExpData": SaveExpData,
     "ExpData": ExpData,
     "PrintExpData:": PrintExpData,
+    "HeadSizeControl": HeadSizeControl,
+    "NeckSlimming": NeckSlimming,
+    "HeadNeckResize": HeadNeckResize,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
     "AdvancedLivePortrait": "Advanced Live Portrait (PHM)",
     "ExpressionEditor": "Expression Editor (PHM)",
     "LoadExpData": "Load Exp Data (PHM)",
-    "SaveExpData": "Save Exp Data (PHM)"
+    "SaveExpData": "Save Exp Data (PHM)",
+    "HeadSizeControl": "Head Size Control (PHM)",
+    "NeckSlimming": "Neck Slimming (PHM)",
+    "HeadNeckResize": "Head & Neck Resize (PHM)"
 }
