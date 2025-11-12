@@ -526,7 +526,8 @@ def logging_time(original_fn):
 #exp_data_dir = os.path.join(current_directory, "exp_data")
 exp_data_dir = os.path.join(folder_paths.output_directory, "exp_data")
 if os.path.isdir(exp_data_dir) == False:
-    os.mkdir(exp_data_dir)
+    os.makedirs(exp_data_dir, exist_ok=True)
+    # os.mkdir(exp_data_dir)
 class SaveExpData:
     @classmethod
     def INPUT_TYPES(s):
